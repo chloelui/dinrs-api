@@ -1,6 +1,9 @@
 import { Router } from "express";
 import multer from "multer";
-import pool from "../db.js";
+import { supabaseAdmin } from "../supabaseClient.js";
+import { requireAuth, requireProfile } from "../middleware/auth";
+import { asyncHandler, parseId, unwrap, toApiUser, toApiProfile } from "../utils/helpers";
+import { parse } from "dotenv";
 
 const router = Router();
 
@@ -17,31 +20,6 @@ const upload = multer({
   },
 });
 
-// ---------- helpers ----------
-const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-function parseId(value) {
-    const id = Number(value);
-    return Number.isInteger(id) && id > 0 ? id : null;
-}
-
-// Converts database row (snake case) to JSON shape the frontend uses (camel case)
-function toApiUser(row) {
-    return {
-        id: row.id,
-        firstName: row.first_name,
-        lastName: row.last_name,
-        email: row.email,
-        major: row.major,
-        graduationYear: String(row.graduation_year),
-        bio: row.bio,
-        profilePicture: row.profile_picture_url,
-        diningHalls: row.dining_halls,
-        favoriteFoods: row.favorite_foods,
-        createdAt: row.created_at,
-    };
-}
-
 function fileToDataUrl(file) {
   const type = file.mimetype ?? file.mimeType;
   return `data:${type};base64,${file.buffer.toString("base64")}`;
@@ -51,11 +29,7 @@ function parseList(value) {
     if (value === undefined) return undefined;
     let list = value;
     if (typeof value === "string") {
-        try {
-            list = JSON.parse(value);
-        } catch {
-            return null;
-        }
+        try { list = JSON.parse(value); } catch { return null; }
     }
     if (!Array.isArray(list) || !list.every((item) => typeof item === "string")) return null;
     return list.map((item) => item.trim()).filter(Boolean);
@@ -95,10 +69,36 @@ function readFields(body, { requireAll }) {
     return { values, errors };
 }
 
+// Translate validated camelCase into snake_case columns
+function toColumns(v) {
+    const cols = {};
+    if (v.firstName !== undefined) cols.first_name = v.firstName;
+    if (v.lastName !== undefined) cols.last_name = v.lastName;
+    if (v.email !== undefined) cols.email = v.email;
+    if (v.major !== undefined) cols.major = v.major;
+    if (v.graduationYear !== undefined) cols.graduation_year = Number(v.graduationYear);
+    if (v.bio !== undefined) cols.bio = v.bio;
+    if (v.diningHalls !== undefined) cols.dining_halls = v.diningHalls;
+    if (v.favoriteFoods !== undefined) cols.favorite_foods = v.favoriteFoods;
+    return cols;
+}
+
+// ---------- GET /users/profiles (login required) ----------
+router.get("/profiles", requireAuth, asyncHandler(async (req, res) => {
+    const rows = unwrap(
+        await supabaseAdmin.from("users").select("*, user_profiles ( date_of_birth, hometown, pronouns, instagram_handle, dietary_restrictions )").order("id")
+    );
+
+    res.json(rows.map((row) => {
+        const p = Array.isArray(row.user_profiles) ? row.user_profiles[0] : row.user_profiles;
+        return { ...toApiUser(row), profile: toApiProfile(p) };
+    }));
+}));
+
 // ---------- GET /users ----------
 router.get("/", asyncHandler(async (req, res) => {
-    const result = await pool.query("SELECT * FROM users ORDER BY id");
-    res.json(result.rows.map(toApiUser));
+    const rows = unwrap(await supabaseAdmin.from("users").select("*").order("id"));
+    res.json(rows.map(toApiUser));
 }));
 
 // ---------- GET /users/:id ----------
@@ -106,85 +106,43 @@ router.get("/:id", asyncHandler(async (req, res) => {
     const id = parseId(req.params.id);
     if (!id) return res.status(400).json({ error: "Invalid user id." });
 
-    const result = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found." });
-
-    res.json(toApiUser(result.rows[0]));
-}));
+    const row = unwrap(await supabaseAdmin.from("users").select("*").eq("id", id).maybeSingle());
+    if (!row) return res.status(404).json({ error: "User not found." });
+    res.json(toApiUser(row));
+}))
 
 // ---------- POST /users ----------
 router.post("/", upload.single("image"), asyncHandler(async (req, res) => {
     const { values, errors } = readFields(req.body ?? {}, { requireAll: true });
     if (errors.length > 0) return res.status(400).json({ error: errors.join(" ") });
 
-    const picture = req.file ? fileToDataUrl(req.file) : null;
-
-    const result = await pool.query(
-        `INSERT INTO users
-            (first_name, last_name, email, major, graduation_year, bio,
-            profile_picture_url, dining_halls, favorite_foods)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING *`,
-        [
-            values.firstName,
-            values.lastName,
-            values.email,
-            values.major,
-            Number(values.graduationYear),
-            values.bio ?? "",
-            picture,
-            values.diningHalls ?? [],
-            values.favoriteFoods ?? [],
-        ]
+    const row = unwrap(
+        await supabaseAdmin.from("users").insert({
+            ...toColumns(values),
+            profile_picture_url: req.file ? fileToDataUrl(req.file) : null,
+        }).select().single()
     );
-
-    res.status(201).json(toApiUser(result.rows[0]));
+    res.status(201).json(toApiUser(row));
 }));
 
 // ---------- PUT /users/:id ----------
 router.put("/:id", upload.single("image"), asyncHandler(async (req, res) => {
     const id = parseId(req.params.id);
-    if (!id) return res.status(400).json({ error: "Invalid user id. "});
+    if (!id) return res.status(400).json({ error: "Invalid user id." });
 
     const body = req.body ?? {};
     const { values, errors } = readFields(body, { requireAll: false });
-    if (errors.length > 0) return res.status(400).json({ error: errors.join(" ")});
+    if (errors.length > 0) return res.status(400).json({ error: errors.join(" ") });
 
-    const removePicture = body.removeImage === "true" || body.removeImage === true;
-    const pictureProvided = Boolean(req.file) || removePicture;
-    const picture = req.file ? fileToDataUrl(req.file) : null;
+    const updates = { ...toColumns(values), updated_at: new Date().toISOString() };
+    if (req.file) updates.profile_picture_url = fileToDataUrl(req.file);
+    else if (body.removeImage === "true" || body.removeImage === true) updates.profile_picture_url = null;
 
-    const result = await pool.query(
-        `UPDATE users SET
-            first_name          = COALESCE($1, first_name),
-            last_name           = COALESCE($2, last_name),
-            email               = COALESCE($3, email),
-            major               = COALESCE($4, major),
-            graduation_year     = COALESCE($5::integer, graduation_year),
-            bio                 = COALESCE($6, bio),
-            profile_picture_url = CASE WHEN $7::boolean THEN $8::text ELSE profile_picture_url END,
-            dining_halls        = COALESCE($9::text[], dining_halls),
-            favorite_foods      = COALESCE($10::text[], favorite_foods),
-            updated_at          = NOW()
-        WHERE id = $11
-        RETURNING *`,
-        [
-            values.firstName ?? null,
-            values.lastName ?? null,
-            values.email ?? null,
-            values.major ?? null,
-            values.graduationYear ? Number(values.graduationYear) : null,
-            values.bio ?? null,
-            pictureProvided,
-            picture,
-            values.diningHalls ?? null,
-            values.favoriteFoods ?? null,
-            id,
-        ]
+    const row = unwrap(
+        await supabaseAdmin.from("users").update(updates).eq("id", id).select().maybeSingle()
     );
-
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found." });
-    res.json(toApiUser(result.rows[0]));
+    if (!row) return res.status(404).json({ error: "User not found." });
+    res.json(toApiUser(row));
 }));
 
 // ---------- DELETE /users/:id ----------
@@ -192,54 +150,94 @@ router.delete("/:id", asyncHandler(async (req, res) => {
     const id = parseId(req.params.id);
     if (!id) return res.status(400).json({ error: "Invalid user id." });
 
-    const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found." });
-
+    const deleted = unwrap(await supabaseAdmin.from("users").delete().eq("id", id).select("id"));
+    if (deleted.length === 0) return res.status(404).json({ error: "User not found." });
     res.status(204).end();
 }));
 
-// ---------- connections ----------
-// GET /users/:id/connections: everyone this user has connected with
-router.get("/:id/connections", asyncHandler(async (req, res) => {
-    const id = parseId(req.params.id);
-    if (!id) return res.status(400).json({ error: "Invalid user id." });
+// ---------- PUT /users/:id/profile (login required) ----------
+const profileTextFields = {
+    hometown: ["hometown", 100],
+    pronouns: ["pronouns", 50],
+    instagramHandle: ["instagram_handle", 50],
+};
 
-    const result = await pool.query(
-        `SELECT u.*
-            FROM connections c
-            JOIN users u ON u.id = c.connected_user_id
-        WHERE c.user_id = $1
-        ORDER BY c.created_at DESC`,
-        [id]
+router.put("/:id/profile", requireAuth, requireProfile, asyncHandler(async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: "Invalid user id. "});
+    if (req.profile.id !== id && req.profile.role !== "admin") {
+        return res.status(403).json({ error: "You can only edit your own profile." });
+    }
+
+    const body = req.body ?? {};
+    const updates = {};
+
+    if (body.dateOfBirth !== undefined) {
+        const dob = body.dateOfBirth;
+        if (dob === null || dob === "") {
+            updates.date_of_birth = null;
+        } else if (
+            !/^\d{4}-\d{2}-\d{2}$/.test(dob) || Number.isNaN(Date.parse(dob)) || new Date(dob) > new Date()
+        ) {
+            return res.status(400).json({ error: "Date of birth must be a past date like 2005-04-23." });
+        } else {
+            updates.date_of_birth = dob;
+        }
+    }
+
+    for (const [key, [column, max]] of Object.entries(profileTextFields)) {
+        if (body[key] === undefined) continue;
+        const value = String(body[key]).trim();
+        if (value.length > max) return res.status(400).json({ error: `${key} is too long.` });
+        updates[column] = value || null;
+    }
+
+    const restrictions = parseList(body.dietaryRestrictions);
+    if (restrictions === null) return res.status(400).json({ error: "Dietary restrictions must be a list of text values. "});
+    if (restrictions !== undefined) updates.dietary_restrictions = restrictions;
+
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: "Nothing to update. "});
+    updates.updated_at = new Date().toISOString();
+
+    const row = unwrap(
+        await supabaseAdmin.from("user_profiles").upsert({ id, ...updates }).select().single()
     );
-    res.json(result.rows.map(toApiUser));
+    res.json(toApiProfile(row));
 }));
 
-// POST /users/:id/connections with { "connectedUserId": 3 }
+// ---------- GET /users/:id/connections ----------
+router.get("/:id/connections", asyncHandler(async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: "Invalid user id. "});
+
+    const rows = unwrap(
+        await supabaseAdmin.from("connections").select("created_at, connected:users!connected_user_id (*)").eq("user_id", id).order("created_at", { ascending: false })
+    );
+    res.json(rows.map((row) => toApiUser(row.connected)));
+}));
+
+// ---------- POST /users/:id/connections ----------
 router.post("/:id/connections", asyncHandler(async (req, res) => {
     const id = parseId(req.params.id);
     const otherId = parseId(req.body?.connectedUserId);
     if (!id || !otherId) return res.status(400).json({ error: "Invalid user id." });
 
-    await pool.query(
-        `INSERT INTO connections (user_id, connected_user_id)
-        VALUES ($1, $2)
-        ON CONFLICT DO NOTHING`,
-        [id, otherId]
+    unwrap(
+        await supabaseAdmin.from("connections").upsert(
+            { user_id: id, connected_user_id: otherId },
+            { onConflict: "user_id,connected_user_id", ignoreDuplicates: true }
+        )
     );
     res.status(201).json({ userId: id, connectedUserId: otherId });
 }));
 
-// DELETE /users/:id/connections/:otherId
+// ---------- DELETE /users/:id/connections/:otherId ----------
 router.delete("/:id/connections/:otherId", asyncHandler(async (req, res) => {
     const id = parseId(req.params.id);
     const otherId = parseId(req.params.otherId);
     if (!id || !otherId) return res.status(400).json({ error: "Invalid user id." });
 
-    await pool.query(
-        "DELETE FROM connections WHERE user_id = $1 AND connected_user_id = $2",
-        [id, otherId]
-    );
+    unwrap (await supabaseAdmin.from("connections").delete().eq("user_id", id).eq("connected_user_id", otherId));
     res.status(204).end();
 }));
 
