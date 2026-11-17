@@ -1,7 +1,10 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import authRouter from "./routes/auth.js";
 import usersRouter from "./routes/users.js";
+import postsRouter from "./routes/posts.js";
+import adminRouter from "./routes/admin.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,11 +16,14 @@ app.get("/", (req, res) => {
   res.json({ status: "users_api is running" });
 });
 
+app.use("/auth", authRouter);
 app.use("/users", usersRouter);
+app.use("/posts", postsRouter);
+app.use("/admin", adminRouter);
 
 // Send JSON 404 if nothing matched
 app.use((req, res) => {
-    res.status(404).json({ error: "Not found "});
+    res.status(404).json({ error: "Not found" });
 });
 
 // Errors thrown anywhere stored here
