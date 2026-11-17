@@ -1,8 +1,8 @@
 import { Router } from "express";
 import multer from "multer";
 import { supabaseAdmin } from "../supabaseClient.js";
-import { requireAuth, requireProfile } from "../middleware/auth";
-import { asyncHandler, parseId, unwrap, toApiUser, toApiProfile } from "../utils/helpers";
+import { requireAuth, requireProfile } from "../middleware/auth.js";
+import { asyncHandler, parseId, unwrap, toApiUser, toApiProfile } from "../utils/helpers.js";
 import { parse } from "dotenv";
 
 const router = Router();
